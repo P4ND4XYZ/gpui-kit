@@ -270,6 +270,26 @@ impl LeafSpan {
 }
 
 impl RenderedIndex {
+    /// Exact membership only: separators and inline atoms are not nearby text.
+    pub(super) fn strict_position(&self, offset: usize) -> Option<(usize, TextLeafKey, usize)> {
+        if !self.text.is_char_boundary(offset) {
+            return None;
+        }
+        let leaf = self
+            .leaves
+            .iter()
+            .find(|leaf| leaf.range.contains(&offset))?;
+        let local = offset - leaf.range.start;
+        if leaf.objects.iter().any(|object| object.contains(&local)) {
+            return None;
+        }
+        let block = self
+            .blocks
+            .iter()
+            .position(|block| block.contains(&offset))?;
+        Some((block, leaf.key, local))
+    }
+
     pub(super) fn new(document: &ParsedDocument) -> Self {
         let mut builder = IndexBuilder::default();
         let mut blocks = Vec::with_capacity(document.blocks.len());

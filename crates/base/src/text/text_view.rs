@@ -816,9 +816,14 @@ impl Element for TextView {
             .when(self.scrollable, |this| {
                 this.child(
                     div().absolute().inset_0().child(
-                        crate::Scrollbar::vertical(&list_state)
-                            .id(("text-view-scrollbar", state.entity_id()))
-                            .viewport_from_layout(),
+                        crate::Scrollbar::vertical(
+                            &state
+                                .read(cx)
+                                .line_reveal
+                                .scrollbar_handle(list_state.clone()),
+                        )
+                        .id(("text-view-scrollbar", state.entity_id()))
+                        .viewport_from_layout(),
                     ),
                 )
             })
@@ -914,6 +919,17 @@ impl Element for TextView {
             state.read(cx).selection_adapter.begin_frame();
         }
 
+        let weak = state.downgrade();
+        let view_bounds = prepaint.hitbox.bounds;
+        window.on_mouse_event(move |event: &gpui::ScrollEvent, phase, _, cx| {
+            if phase == gpui::DispatchPhase::Capture && view_bounds.contains(&event.position) {
+                let _ = weak.update(cx, |state, _| {
+                    state
+                        .line_reveal
+                        .cancel(super::TextRevealCancellation::UserScroll)
+                });
+            }
+        });
         GlobalState::global(cx).push_text_view_state(state.clone());
         if let Some(clip_bottom) = prepaint.clip_bottom {
             // Snap the `max_lines` clip to the last whole line that fits, so a
@@ -928,6 +944,7 @@ impl Element for TextView {
             request_layout.element.paint(window, cx);
         }
         GlobalState::global(cx).pop_text_view_state();
+        state.update(cx, |state, _| super::line_reveal::painted(state, window));
 
         // Every list has scrolled by now, so the line of a reveal is where
         // it ends up this frame.

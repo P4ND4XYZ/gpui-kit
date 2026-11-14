@@ -34,6 +34,7 @@ pub(super) struct InlineFlow {
     /// The block editor leaf this flow renders (design D3): its fragments
     /// and atoms are reported to the editor sink as pieces.
     editor_key: Option<u64>,
+    strict_offset: Option<usize>,
 }
 
 /// Bytes an image or custom inline node occupies in an editor leaf (one
@@ -284,7 +285,13 @@ impl InlineFlow {
             items,
             link_click_handler,
             editor_key: None,
+            strict_offset: None,
         }
+    }
+
+    pub(super) fn strict_offset(mut self, offset: Option<usize>) -> Self {
+        self.strict_offset = offset;
+        self
     }
 
     pub(super) fn editor_key(mut self, key: Option<u64>) -> Self {
@@ -508,8 +515,10 @@ impl Element for InlineFlow {
         // their bytes, images and custom nodes one U+FFFC.
         let editor = self.editor_key.zip(super::editor_seam::current());
         // Ordinary TextViews do not allocate editor bookkeeping.
-        let item_starts: Vec<usize> = if let Some((key, sink)) = &editor {
-            sink.begin_pieces(*key);
+        let item_starts: Vec<usize> = if editor.is_some() || self.strict_offset.is_some() {
+            if let Some((key, sink)) = &editor {
+                sink.begin_pieces(*key);
+            }
             let mut at = 0;
             self.items
                 .iter()
@@ -682,6 +691,11 @@ impl Element for InlineFlow {
                             .filter(|_| reveal_fragment == Some(fragment_ix))
                             .map(|reveal| reveal.clamp(source_range.start, source_range.end)),
                     )
+                    .strict_offset(self.strict_offset.and_then(|offset| {
+                        let start = item_starts[*item_ix] + source_range.start;
+                        let end = item_starts[*item_ix] + source_range.end;
+                        (offset >= start && offset < end).then(|| offset - start)
+                    }))
                     .text_style(fragment_style.clone());
                     let element = element.editor_piece(
                         editor

@@ -147,14 +147,14 @@ pub struct TextViewState {
     fade_tick: Option<Task<()>>,
     /// Content format (markdown / html), used for bounded synchronous parsing
     /// of small full-replace updates.
-    format: TextViewFormat,
+    pub(super) format: TextViewFormat,
     text: String,
     /// The text a `TextView` element last handed over, to recognize the same
     /// string next frame without comparing its bytes.
     element_text: Option<SharedString>,
-    revision: usize,
+    pub(super) revision: usize,
     /// The revision of the update `parsed_content` was committed from.
-    committed_revision: usize,
+    pub(super) committed_revision: usize,
     /// The revision of the last update that replaced the text rather than
     /// appending to it.
     full_update_revision: usize,
@@ -164,7 +164,9 @@ pub struct TextViewState {
     pub(super) pending_reveal: Option<PendingReveal>,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
-    layout_text_style: Option<(gpui::TextStyle, Pixels)>,
+    pub(super) layout_text_style: Option<(gpui::TextStyle, Pixels)>,
+    pub(super) line_reveal: super::line_reveal::LineRevealState,
+    pub(super) line_reveal_owner: Option<gpui::WeakEntity<Self>>,
     parsed_error: Option<SharedString>,
     tx: Sender<UpdateOptions>,
     _parse_task: Task<()>,
@@ -175,6 +177,29 @@ impl TextViewState {
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
         Self::new(TextViewFormat::Markdown, text, cx)
+    }
+
+    /// Reveals an exact line in `snapshot`, using at most one measured vertical commit.
+    ///
+    /// This additive path never performs a preliminary block jump. Measurement is
+    /// limited to eight attempts (including the first) and one second, whichever
+    /// comes first; a timer also expires a request when no frames are drawn.
+    /// Success is observed after the final visible paint, not merely acceptance.
+    /// Invalid/stale targets and unsupported geometry return a terminal handle.
+    /// Supports only scrollable, unclamped Markdown views. Non-scrollable or
+    /// max-lines-clamped views return `Failed(UnsupportedGeometry)`, including
+    /// already-visible ordinary text; use the unchanged legacy `reveal_range`
+    /// for fit-content/ancestor-list navigation. Opaque custom
+    /// renderers and image-containing measurement subtrees are rejected before
+    /// speculative rendering. Existing `reveal_range` behavior is unchanged.
+    /// Cancel the returned handle before conflicting programmatic list scrolling.
+    pub fn request_line_reveal(
+        &mut self,
+        snapshot: &RenderedText,
+        target: super::TextRevealTarget,
+        cx: &mut Context<Self>,
+    ) -> super::TextRevealHandle {
+        super::line_reveal::request(self, snapshot, target, cx)
     }
 
     /// Create a HTML TextViewState.
@@ -258,6 +283,8 @@ impl TextViewState {
             selection_revision: 0,
             compatible_layout_update: false,
             layout_text_style: None,
+            line_reveal: Default::default(),
+            line_reveal_owner: Some(cx.entity().downgrade()),
             tx,
             _parse_task,
             _receive_task,
@@ -497,6 +524,7 @@ impl TextViewState {
     /// while keeping their old sizes as hints, so the scrollbar does not
     /// collapse in the frame before the next layout measures the real heights.
     fn invalidate_measured_heights(&self) {
+        self.line_reveal.invalidate_layout();
         let count = self.list_state.item_count();
         if count > 0 {
             self.list_state.remeasure_items(0..count);
@@ -520,6 +548,9 @@ impl TextViewState {
     }
 
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
+        self.line_reveal
+            .cancel(super::TextRevealCancellation::ContentChanged);
+        self.line_reveal.inner.borrow_mut().clear();
         self.revision += 1;
         if !append {
             self.full_update_revision = self.revision;
@@ -720,12 +751,16 @@ impl TextViewState {
         if text.is_empty() && range == (0..0) {
             // Nothing to reveal in an empty view.
             self.pending_reveal = None;
+            self.line_reveal
+                .cancel(super::TextRevealCancellation::Superseded);
             return Ok(());
         }
         let now = cx.background_executor().now();
-        self.pending_reveal = Some(
-            PendingReveal::new(&text, &range, now).ok_or(RangeHighlightError::InvalidRange(0))?,
-        );
+        let pending =
+            PendingReveal::new(&text, &range, now).ok_or(RangeHighlightError::InvalidRange(0))?;
+        self.line_reveal
+            .cancel(super::TextRevealCancellation::Superseded);
+        self.pending_reveal = Some(pending);
         cx.notify();
         Ok(())
     }
@@ -1141,6 +1176,9 @@ impl Render for TextViewState {
             range_highlights: self.range_highlights.clone(),
             reveal,
             body_font_size,
+            strict: self
+                .scrollable
+                .then(|| self.line_reveal.render(cx.entity().downgrade())),
         };
 
         let content = v_flex()
@@ -1218,7 +1256,7 @@ impl Render for TextViewState {
         if let Some(block_ix) = reveal_block {
             self.list_state.scroll_to_reveal_item(block_ix);
         }
-        content
+        super::line_reveal::RevealElement::new(content.into_any_element(), cx.entity().downgrade())
     }
 }
 

@@ -232,7 +232,9 @@ impl Element for TableCellElement {
     ) {
         // Prepaint runs for the whole window before any text paints, so the
         // cell that holds the anchor is known to all text, in every view.
-        if let Some(view) = GlobalState::global(cx).text_view_state() {
+        if !super::line_reveal::is_measuring()
+            && let Some(view) = GlobalState::global(cx).text_view_state()
+        {
             view.read(cx)
                 .selection_adapter
                 .record_table_cell(bounds, cx);
@@ -2564,7 +2566,7 @@ impl CodeBlock {
                     .child(lang)
             });
 
-        let block = div()
+        let mut block = div()
             .w_full()
             .min_w_0()
             .px_4()
@@ -2581,6 +2583,12 @@ impl CodeBlock {
             .text_size(cx.theme().tokens.typography.mono_md.size)
             .line_height(relative(1.6))
             .relative()
+            // A capped row must retain the code's intrinsic height rather than
+            // stretching its text layout down to the scroll viewport.
+            .when(
+                style.code_block().flex_direction == Some(gpui::FlexDirection::Row),
+                |this| this.items_start(),
+            )
             .refine_style(&style.code_block())
             .child(
                 Inline::new(
@@ -2600,8 +2608,11 @@ impl CodeBlock {
                     node_cx.link_click_handler.clone(),
                 )
                 .range_backgrounds(node_cx.range_backgrounds(leaf_key).to_vec())
-                .reveal(node_cx.reveal_at(leaf_key, 0, self.code().len())),
+                .reveal(node_cx.reveal_at(leaf_key, 0, self.code().len()))
+                .strict_offset(node_cx.strict_offset(leaf_key)),
             );
+        let mut scroll_style = gpui::Style::default();
+        scroll_style.refine(block.style());
         let actions = node_cx.code_block_actions.clone().map(|actions| {
             div()
                 .id("actions")
@@ -2616,14 +2627,16 @@ impl CodeBlock {
         // like `"copy"` don't collide across blocks.
         let id = block_element_id("codeblock", self.span, options.ix);
         let block = if matches!(style.code_block().overflow.y, Some(Overflow::Scroll)) {
-            let scroll_handle = window
-                .use_keyed_state(
-                    block_element_id("codeblock-scroll", self.span, options.ix),
-                    cx,
-                    |_, _| ScrollHandle::default(),
-                )
-                .read(cx)
-                .clone();
+            let key = super::line_reveal::ScrollKey {
+                source: self.span.map_or(options.ix, |s| s.start),
+                code: true,
+            };
+            let scroll_handle = node_cx.scroll_handle(
+                key,
+                block_element_id("codeblock-scroll", self.span, options.ix),
+                window,
+                cx,
+            );
             // Scroll mode is opted in by setting `style.code_block`'s
             // `overflow.y` to `Overflow::Scroll`.
             // The mask consumes the wheel in the capture phase, so an ancestor
@@ -2635,7 +2648,14 @@ impl CodeBlock {
                 .w_full()
                 .min_w_0()
                 .relative()
-                .child(block.id("scroll").track_scroll(&scroll_handle))
+                .child(super::line_reveal::Frame::new(
+                    block
+                        .id("scroll")
+                        .track_scroll(&scroll_handle)
+                        .into_any_element(),
+                    Some((key, scroll_handle.clone(), scroll_style)),
+                    node_cx.strict.as_ref().is_some_and(|s| s.empty(leaf_key)),
+                ))
                 .child(ScrollableMask::new(Axis::Vertical, &scroll_handle).id(id))
                 .child(
                     div()
@@ -2654,6 +2674,13 @@ impl CodeBlock {
             }
         };
 
+        let block = if !matches!(style.code_block().overflow.y, Some(Overflow::Scroll))
+            && node_cx.strict.as_ref().is_some_and(|s| s.empty(leaf_key))
+        {
+            super::line_reveal::Frame::new(block, None, true)
+        } else {
+            block
+        };
         gapped(
             block,
             if options.is_last {
@@ -2662,6 +2689,66 @@ impl CodeBlock {
                 style.paragraph_gap()
             },
         )
+    }
+}
+
+impl BlockNode {
+    /// Detach every mutable text/selection state, not just the target leaf.
+    /// Opaque renderers are rejected before any speculative callback executes.
+    pub(super) fn measurement_clone(&self) -> Option<Self> {
+        fn fresh(state: &Arc<Mutex<InlineState>>) -> Arc<Mutex<InlineState>> {
+            let text = state
+                .lock()
+                .ok()
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            let mut detached = InlineState::default();
+            detached.set_text(text);
+            Arc::new(Mutex::new(detached))
+        }
+        fn paragraph(p: &Paragraph) -> Option<Paragraph> {
+            if p.children
+                .iter()
+                .any(|c| c.image.is_some() || c.custom.is_some())
+            {
+                return None;
+            }
+            let mut copy = p.clone();
+            copy.state = fresh(&p.state);
+            for child in &mut copy.children {
+                child.state = fresh(&child.state);
+                child.custom_selection = Arc::new(Mutex::new(false));
+            }
+            Some(copy)
+        }
+        let mut copy = self.clone();
+        match &mut copy {
+            Self::Root { children, .. }
+            | Self::Blockquote { children, .. }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => {
+                *children = children
+                    .iter()
+                    .map(Self::measurement_clone)
+                    .collect::<Option<Vec<_>>>()?;
+            }
+            Self::Paragraph(p) | Self::Heading { children: p, .. } => {
+                *p = paragraph(p)?;
+            }
+            Self::CodeBlock(code) => {
+                code.state = fresh(&code.state);
+            }
+            Self::Table(table) => {
+                for row in &mut table.children {
+                    for cell in &mut row.children {
+                        cell.children = paragraph(&cell.children)?;
+                    }
+                }
+            }
+            Self::Custom { .. } | Self::Unknown => return None,
+            _ => {}
+        }
+        Some(copy)
     }
 }
 
@@ -2685,12 +2772,40 @@ pub(crate) struct NodeContext {
     pub(crate) range_highlights: Option<Arc<RangeHighlightFrame>>,
     /// The line being scrolled into view, when there is one.
     pub(crate) reveal: Option<RevealRequest>,
+    pub(super) strict: Option<super::line_reveal::StrictRender>,
     /// The font size the text view inherits this frame, or zero when not
     /// resolved; read it through `body_font_size`.
     pub(crate) body_font_size: Pixels,
 }
 
 impl NodeContext {
+    fn scroll_handle(
+        &self,
+        key: super::line_reveal::ScrollKey,
+        id: ElementId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ScrollHandle {
+        if let Some(strict) = &self.strict {
+            if strict.offsets.is_some() {
+                return strict.handle(key, None, cx);
+            }
+        }
+        let handle = window
+            .use_keyed_state(id, cx, |_, _| ScrollHandle::default())
+            .read(cx)
+            .clone();
+        if let Some(strict) = &self.strict {
+            strict.handle(key, Some(handle), cx)
+        } else {
+            handle
+        }
+    }
+
+    fn strict_offset(&self, key: Option<TextLeafKey>) -> Option<usize> {
+        self.strict.as_ref().and_then(|strict| strict.offset(key))
+    }
+
     fn image_source(&self, image: &ImageNode) -> ImageSource {
         match &self.image_source {
             Some(resolve) => resolve(&image.url),
@@ -2865,6 +2980,7 @@ impl Paragraph {
                 node_cx.link_click_handler.clone(),
             )
             .editor_key(self.leaf_key())
+            .strict_offset(node_cx.strict_offset(fade_key))
             .into_any_element();
         }
 
@@ -2898,6 +3014,7 @@ impl Paragraph {
                 node_cx.link_click_handler.clone(),
             )
             .range_backgrounds(backgrounds)
+            .strict_offset(node_cx.strict_offset(fade_key))
             .reveal(reveal)
             .into_any_element();
         }
@@ -4024,14 +4141,16 @@ impl BlockNode {
             .border_color(style.border())
             .refine_style(style.table());
         let body = if scroll {
-            let scroll_handle = window
-                .use_keyed_state(
-                    block_element_id("table-scroll", table.span, options.ix),
-                    cx,
-                    |_, _| ScrollHandle::default(),
-                )
-                .read(cx)
-                .clone();
+            let key = super::line_reveal::ScrollKey {
+                source: table.span.map_or(options.ix, |s| s.start),
+                code: false,
+            };
+            let scroll_handle = node_cx.scroll_handle(
+                key,
+                block_element_id("table-scroll", table.span, options.ix),
+                window,
+                cx,
+            );
             let min_total_w = columns
                 .iter()
                 .map(|column| column.min + column.divider)
@@ -4046,7 +4165,7 @@ impl BlockNode {
             // gesture is locked to its starting axis and a horizontal swipe
             // is consumed before an ancestor scroller (`gpui::list` under
             // `TextView::scrollable`) can take its vertical component.
-            horizontal_scroll_area(
+            let body = horizontal_scroll_area(
                 block_element_id("table", table.span, options.ix),
                 &scroll_handle,
                 &frame,
@@ -4057,7 +4176,11 @@ impl BlockNode {
                 // letting the track exceed the viewport and scroll.
                 div().min_w_full().w(px(min_total_w)).children(rows),
             )
-            .into_any_element()
+            .into_any_element();
+            let mut scroll_style = gpui::Style::default();
+            scroll_style.refine(&frame);
+            scroll_style.overflow = gpui::point(Overflow::Hidden, Overflow::Hidden);
+            super::line_reveal::Frame::new(body, Some((key, scroll_handle, scroll_style)), false)
         } else {
             div()
                 .w_full()

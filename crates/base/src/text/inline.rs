@@ -325,6 +325,7 @@ pub(super) struct Inline {
     range_backgrounds: Vec<(Range<usize>, Hsla)>,
     /// The start of a pending reveal, when it is in this text.
     reveal: Option<RevealAt>,
+    strict_offset: Option<usize>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     /// What this frame's layout was shaped with, to hand the shaped text to
     /// the next frame (see [`RetainedLayout`]).
@@ -711,6 +712,7 @@ impl Inline {
             selection_source: None,
             range_backgrounds: Vec::new(),
             reveal: None,
+            strict_offset: None,
             link_click_handler,
             retained_key: None,
             handed_over: false,
@@ -763,6 +765,59 @@ impl Inline {
     pub(super) fn reveal(mut self, reveal: Option<RevealAt>) -> Self {
         self.reveal = reveal;
         self
+    }
+
+    pub(super) fn strict_offset(mut self, offset: Option<usize>) -> Self {
+        self.strict_offset = offset;
+        self
+    }
+
+    fn observe_strict(&self, window: &Window) {
+        let Some(offset) = self.strict_offset else {
+            return;
+        };
+        let layout = self.styled_text.layout();
+        let bounds = layout.bounds();
+        let text = layout.text();
+        let glyphs = glyph_boxes(
+            layout,
+            self.text_style
+                .as_ref()
+                .map_or_else(|| window.text_style().text_align, |s| s.text_align),
+            bounds.size.width,
+        );
+        let geometry = if let Some((row, left, right)) =
+            range_boxes(&glyphs, offset..offset.saturating_add(1))
+                .first()
+                .copied()
+        {
+            Some(Bounds::from_corners(
+                point(
+                    bounds.left() + left.min(right),
+                    bounds.top() + layout.line_height() * row as f32,
+                ),
+                point(
+                    bounds.left() + left.max(right),
+                    bounds.top() + layout.line_height() * (row + 1) as f32,
+                ),
+            ))
+        } else if offset <= text.len()
+            && (text.as_bytes().get(offset) == Some(&b'\n')
+                || (offset == text.len() && text.ends_with('\n')))
+        {
+            layout
+                .position_for_index(offset)
+                .map(|origin| Bounds::new(origin, size(Pixels::ZERO, layout.line_height())))
+        } else {
+            None
+        };
+        if let Some(mut rect) = geometry {
+            if let Some(row) = self.selection_bounds {
+                rect.origin.y = row.top();
+                rect.size.height = row.size.height;
+            }
+            super::line_reveal::observe(rect, window);
+        }
     }
 
     /// Ask the enclosing list to scroll the line of the pending reveal into
@@ -1178,7 +1233,9 @@ impl Element for Inline {
         // `max_lines` can snap its clip to a whole-line boundary. The state
         // stack only holds an entry during prepaint when that view set
         // `max_lines`, so this is a no-op otherwise.
-        if let Some(text_view_state) = GlobalState::global(cx).text_view_state() {
+        if !super::line_reveal::is_measuring()
+            && let Some(text_view_state) = GlobalState::global(cx).text_view_state()
+        {
             let state = text_view_state.read(cx);
             if state.max_lines.is_some()
                 && let Ok(mut line_spans) = state.line_spans.lock()
@@ -1192,6 +1249,7 @@ impl Element for Inline {
         }
 
         self.request_reveal(window);
+        self.observe_strict(window);
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         self.retain_styled_text(cx);
