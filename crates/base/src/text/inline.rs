@@ -393,6 +393,17 @@ thread_local! {
     static SWEPT_AT_DROPS: Cell<usize> = const { Cell::new(0) };
 }
 
+pub(super) fn probe_retained_line(
+    state: &Arc<Mutex<InlineState>>,
+    offset: usize,
+) -> Option<Bounds<Pixels>> {
+    RETAINED_LAYOUTS.with(|layouts| {
+        let layouts = layouts.borrow();
+        let retained = layouts.get(&state_key(state))?;
+        super::editor_host::probe_layout_line(retained.styled_text.layout(), offset)
+    })
+}
+
 /// Dead entries (states that were dropped without a final paint, e.g. a
 /// replaced document) are swept once the table grows past this many, or by
 /// the UI cleanup task after an [`InlineState`] was dropped.

@@ -417,6 +417,15 @@ enum BlockTextKind {
 }
 
 impl BlockNode {
+    pub(super) fn probe_retained_line(&self, offset: usize) -> Option<Bounds<Pixels>> {
+        let state = match self {
+            Self::Paragraph(paragraph) => &paragraph.state,
+            Self::CodeBlock(code) => &code.state,
+            _ => return None,
+        };
+        super::inline::probe_retained_line(state, offset)
+    }
+
     pub(super) fn is_list_item(&self) -> bool {
         matches!(self, Self::ListItem { .. })
     }

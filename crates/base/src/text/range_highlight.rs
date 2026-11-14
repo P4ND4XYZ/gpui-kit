@@ -1560,6 +1560,13 @@ impl PendingReveal {
         matches!(self.target, RevealTarget::Block { .. })
     }
 
+    pub(super) fn probe_line_offset(&self) -> Option<usize> {
+        match self.target {
+            RevealTarget::Line { offset, .. } => Some(offset),
+            RevealTarget::Block { .. } => None,
+        }
+    }
+
     /// The index of the top-level block of `document` the reveal starts in.
     pub(super) fn block_ix(&self, document: &ParsedDocument) -> Option<usize> {
         match self.target {

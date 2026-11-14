@@ -274,6 +274,13 @@ pub fn collect_leaf_geometry<R>(
     (result, leaves)
 }
 
+pub(super) fn probe_layout_line(layout: &TextLayout, index: usize) -> Option<Bounds<Pixels>> {
+    LeafGeometry {
+        pieces: vec![Piece::Whole(LayoutSnapshot::new(layout))],
+    }
+    .probe_line_bounds(index)
+}
+
 struct Collector {
     pieces: RefCell<HashMap<u64, Vec<Piece>>>,
     decorations: HashMap<u64, Vec<(Range<usize>, Hsla)>>,
@@ -427,6 +434,29 @@ pub struct LeafGeometry {
 }
 
 impl LeafGeometry {
+    /// Prototype-only geometry for a plain text leaf, including hard-break lines.
+    pub(super) fn probe_line_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let layout = self.whole()?;
+        let text = layout.text();
+        if index > text.len() || !text.is_char_boundary(index) {
+            return None;
+        }
+        let start = layout.position_for_index(index)?;
+        let width = match text[index..].chars().next() {
+            None | Some('\n') => px(1.), // Provisional empty-line/caret region.
+            Some(ch) => {
+                let end = layout.position_for_index(index + ch.len_utf8())?;
+                // Soft-wrap affinity and bidi/combining clusters need a glyph
+                // rectangle contract. Fail rather than inventing their width.
+                if end.y != start.y || end.x <= start.x {
+                    return None;
+                }
+                end.x - start.x
+            }
+        };
+        Some(Bounds::new(start, gpui::size(width, layout.line_height())))
+    }
+
     fn whole(&self) -> Option<&LayoutSnapshot> {
         match self.pieces.as_slice() {
             [Piece::Whole(layout)] => Some(layout),

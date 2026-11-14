@@ -107,6 +107,43 @@ pub(super) struct LineSpan {
     pub(super) line_height: Pixels,
 }
 
+/// A prototype measurement, not a reveal-completion contract.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct OffscreenLineProbe {
+    block_ix: usize,
+    line: Bounds<Pixels>,
+    block_height: Pixels,
+}
+
+impl OffscreenLineProbe {
+    pub fn block_ix(&self) -> usize {
+        self.block_ix
+    }
+    /// The character-width line box, relative to its top-level block.
+    pub fn line(&self) -> Bounds<Pixels> {
+        self.line
+    }
+    pub fn block_height(&self) -> Pixels {
+        self.block_height
+    }
+    /// Positive means scrolling down; no padding or movement if fully visible.
+    pub fn correction(&self, block_top: Pixels, viewport: Bounds<Pixels>) -> Option<Pixels> {
+        if self.line.size.height > viewport.size.height {
+            return None;
+        }
+        let top = block_top + self.line.top();
+        let bottom = block_top + self.line.bottom();
+        Some(if top < viewport.top() {
+            top - viewport.top()
+        } else if bottom > viewport.bottom() {
+            bottom - viewport.bottom()
+        } else {
+            Pixels::ZERO
+        })
+    }
+}
+
 /// The state of a TextView.
 pub struct TextViewState {
     entity_id: EntityId,
@@ -728,6 +765,159 @@ impl TextViewState {
         );
         cx.notify();
         Ok(())
+    }
+
+    /// Observes the live renderer's retained layout without modifying it.
+    /// A previously painted offscreen leaf may return stale coordinates.
+    #[doc(hidden)]
+    pub fn probe_retained_range(&self, range: Range<usize>, cx: &App) -> Option<Bounds<Pixels>> {
+        let pending = PendingReveal::new(
+            &self.rendered_text(),
+            &range,
+            cx.background_executor().now(),
+        )?;
+        let ix = pending.block_ix(&self.parsed_content.document)?;
+        self.parsed_content.document.blocks[ix].probe_retained_line(pending.probe_line_offset()?)
+    }
+
+    /// Minimal offscreen-measurement experiment. Call only during prepaint,
+    /// after the real view has laid out. It never scrolls or paints. Unsupported
+    /// shapes fail rather than falling back to block navigation. This deliberately
+    /// does not promise request lifecycle, stale-result handling or media support.
+    #[doc(hidden)]
+    pub fn probe_measure_range(
+        &self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<OffscreenLineProbe, &'static str> {
+        use crate::text::{
+            document::{NodeRenderOptions, flow_position},
+            editor_host::collect_leaf_geometry,
+            node::BlockNode,
+        };
+        use gpui::{AvailableSpace, div, point, size};
+        if !self.scrollable || self.max_lines.is_some() {
+            return Err("unsupported viewport");
+        }
+        let viewport = self.list_state.viewport_bounds();
+        if viewport.size.width <= Pixels::ZERO {
+            return Err("not laid out");
+        }
+        let pending = PendingReveal::new(
+            &self.rendered_text(),
+            &range,
+            cx.background_executor().now(),
+        )
+        .ok_or("invalid range")?;
+        let ix = pending
+            .block_ix(&self.parsed_content.document)
+            .ok_or("no block")?;
+        let offset = pending.probe_line_offset().ok_or("not a text line")?;
+        // Rekeying detaches retained selection and TextLayout caches from the
+        // live AST. A namespace separates GPUI keyed state as well.
+        let block = match &self.parsed_content.document.blocks[ix] {
+            BlockNode::CodeBlock(code) if self.code_block_actions.is_none() => {
+                BlockNode::CodeBlock(code.clone().with_leaf_key(0))
+            }
+            BlockNode::Paragraph(paragraph)
+                if paragraph
+                    .children()
+                    .iter()
+                    .all(|run| run.as_image().is_none() && run.as_custom().is_none()) =>
+            {
+                BlockNode::Paragraph(paragraph.clone().with_leaf_key(0))
+            }
+            _ => return Err("prototype supports plain paragraph/code blocks only"),
+        };
+        let typography = self.layout_text_style.as_ref().ok_or("no typography")?;
+        if typography.1 != window.rem_size() {
+            return Err("stale rem size");
+        }
+        if typography.0.text_align != gpui::TextAlign::Left {
+            return Err("prototype requires left-aligned text");
+        }
+        let node_cx = NodeContext {
+            offset: self.parsed_content.node_cx.offset,
+            link_refs: self.parsed_content.node_cx.link_refs.clone(),
+            style: self.text_view_style.clone(),
+            code_block_highlighter: self.code_block_highlighter.clone(),
+            markdown_extensions: self.markdown_extensions.clone(),
+            body_font_size: typography.0.font_size.to_pixels(typography.1),
+            ..Default::default()
+        };
+        let (is_first, prev) = flow_position(&self.parsed_content.document.blocks, ix);
+        let previous_autoscroll = window.take_autoscroll();
+        let text_style = &typography.0;
+        let text_refinement = gpui::TextStyleRefinement {
+            color: Some(text_style.color),
+            font_family: Some(text_style.font_family.clone()),
+            font_features: Some(text_style.font_features.clone()),
+            font_fallbacks: text_style.font_fallbacks.clone(),
+            font_size: Some(text_style.font_size),
+            line_height: Some(text_style.line_height),
+            font_weight: Some(text_style.font_weight),
+            font_style: Some(text_style.font_style),
+            background_color: text_style.background_color,
+            underline: text_style.underline,
+            strikethrough: text_style.strikethrough,
+            white_space: Some(text_style.white_space),
+            text_overflow: text_style.text_overflow.clone(),
+            text_align: Some(text_style.text_align),
+            line_clamp: text_style.line_clamp,
+        };
+        let measured = window.with_text_style(Some(text_refinement), |window| {
+            window.with_element_namespace("offscreen-line-probe", |window| {
+                let mut element = div()
+                    .child(block.render_block(
+                        NodeRenderOptions {
+                            ix,
+                            is_first,
+                            prev,
+                            is_last: ix + 1 == self.parsed_content.document.blocks.len(),
+                            ..Default::default()
+                        },
+                        &node_cx,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element();
+                let size = element.layout_as_root(
+                    size(
+                        AvailableSpace::Definite(viewport.size.width),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                );
+                // Roll back hitboxes, dispatch nodes and accessed GPUI state.
+                // External AST caches are isolated by with_leaf_key above.
+                let result: Result<(), _> = window.transact(|window| {
+                    let (_, geometry) = collect_leaf_geometry(Default::default(), || {
+                        element.prepaint_at(point(Pixels::ZERO, Pixels::ZERO), window, cx);
+                    });
+                    Err((size, geometry))
+                });
+                result.unwrap_err()
+            })
+        });
+        let unexpected_scroll = window.take_autoscroll();
+        if let Some(previous) = previous_autoscroll {
+            window.request_autoscroll(previous);
+        }
+        if unexpected_scroll.is_some() {
+            return Err("measurement requested scrolling");
+        }
+        let (size, geometry) = measured;
+        let line = geometry
+            .get(&0)
+            .and_then(|leaf| leaf.probe_line_bounds(offset))
+            .ok_or("no exact text geometry")?;
+        Ok(OffscreenLineProbe {
+            block_ix: ix,
+            line,
+            block_height: size.height,
+        })
     }
 
     /// Remove all range highlights.
